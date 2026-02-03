@@ -1,108 +1,106 @@
 @echo off
 setlocal EnableExtensions
 
-REM ==========================================================
-REM  fix_psinelam_winre.bat
-REM  WinRE-safe offline registry fix for missing boot driver
-REM  Uses FIND (not FINDSTR).
-REM
-REM  Usage:
-REM    fix_psinelam_winre.bat psinelam.sys
-REM  If no arg provided, defaults to psinelam.sys
-REM ==========================================================
-
+REM WinRE Offline Driver Disable Script
+REM Usage: fix_driver_boot.bat psinelam.sys
 set "TARGET=%~1"
 if "%TARGET%"=="" set "TARGET=psinelam.sys"
 
-set "LOG=%~dp0fix_driver_%TARGET%.log"
-echo ==== [%date% %time%] Fix offline boot driver: %TARGET% ==== > "%LOG%"
+set "LOG=%~dp0fix_driver_boot_%TARGET%.log"
+set "TMP=%TEMP%\fix_driver_boot_matches.txt"
+set "TMPKEYS=%TEMP%\fix_driver_boot_keys.txt"
 
-echo.
-echo Target: %TARGET%
-echo Log: %LOG%
-echo.
+echo ========================================================== > "%LOG%"
+echo [%date% %time%] WinRE offline fix for: %TARGET% >> "%LOG%"
+echo ========================================================== >> "%LOG%"
 
-REM --- Detect Windows drive by presence of SYSTEM hive ---
+REM --- Find Windows drive by SYSTEM hive ---
 set "WINDRV="
 for %%D in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do (
-  if exist "%%D:\Windows\System32\Config\SYSTEM" set "WINDRV=%%D:"
-)
-
-if "%WINDRV%"=="" (
-  echo [ERROR] Windows install not found (SYSTEM hive missing).>>"%LOG%"
-  echo ERROR: Could not find Windows installation drive.
-  exit /b 1
-)
-
-echo [OK] Windows found at %WINDRV%>>"%LOG%"
-echo Windows detected at: %WINDRV%
-echo.
-
-REM --- Load offline SYSTEM hive ---
-reg unload HKLM\OFFLINE >nul 2>&1
-reg load HKLM\OFFLINE "%WINDRV%\Windows\System32\Config\SYSTEM" >>"%LOG%" 2>&1
-if errorlevel 1 (
-  echo [ERROR] Failed to load offline SYSTEM hive.>>"%LOG%"
-  echo ERROR: reg load failed.
-  exit /b 2
-)
-
-REM --- Determine active ControlSet from Select\Current ---
-set "CS=ControlSet001"
-for /f "tokens=1,2,3" %%A in ('reg query HKLM\OFFLINE\Select /v Current 2^>nul') do (
-  if /i "%%A"=="Current" (
-    REM %%C looks like 0x1, 0x2, 0x3
-    if /i "%%C"=="0x1" set "CS=ControlSet001"
-    if /i "%%C"=="0x2" set "CS=ControlSet002"
-    if /i "%%C"=="0x3" set "CS=ControlSet003"
+  if exist "%%D:\Windows\System32\Config\SYSTEM" (
+    set "WINDRV=%%D:"
+    goto :FOUNDWIN
   )
 )
 
-echo [OK] Active control set: %CS%>>"%LOG%"
-echo Active ControlSet: %CS%
-echo.
-
-REM --- Enumerate all service keys and check ImagePath for TARGET using FIND ---
-echo Searching registry for services referencing %TARGET%...
-echo Searching registry for services referencing %TARGET%...>>"%LOG%"
-
-set "CHANGED=0"
-
-for /f "delims=" %%K in ('reg query HKLM\OFFLINE\%CS%\Services 2^>nul') do (
-  call :CHECKKEY "%%K"
+:FOUNDWIN
+if "%WINDRV%"=="" (
+  echo [ERROR] Windows not found (no SYSTEM hive). >> "%LOG%"
+  echo Windows not found. Use DISKPART to check letters.
+  echo Log: %LOG%
+  exit /b 1
 )
 
-echo.
-echo [DONE] Disabled services: %CHANGED%>>"%LOG%"
-echo Done. Disabled services: %CHANGED%
-echo Log saved to: %LOG%
-echo.
+echo [OK] Windows detected at %WINDRV% >> "%LOG%"
+echo Windows detected at: %WINDRV%
 
-REM --- Unload hive ---
-reg unload HKLM\OFFLINE >>"%LOG%" 2>&1
+REM --- Load offline SYSTEM hive ---
+reg unload HKLM\OFFLINE >nul 2>&1
+reg load HKLM\OFFLINE "%WINDRV%\Windows\System32\Config\SYSTEM" >> "%LOG%" 2>&1
+if errorlevel 1 (
+  echo [ERROR] reg load failed. >> "%LOG%"
+  echo Failed to load offline SYSTEM hive.
+  echo Log: %LOG%
+  exit /b 2
+)
 
-echo Reboot now:
+REM --- Determine Active ControlSet ---
+set "CUR="
+for /f "tokens=3" %%i in ('reg query HKLM\OFFLINE\Select /v Current 2^>nul ^| findstr /i "Current"') do set "CUR=%%i"
+
+set "CS=ControlSet001"
+if "%CUR%"=="2" set "CS=ControlSet002"
+if "%CUR%"=="3" set "CS=ControlSet003"
+if "%CUR%"=="4" set "CS=ControlSet004"
+
+echo [OK] Using %CS% (Select\Current=%CUR%) >> "%LOG%"
+echo Active control set: %CS%
+
+REM --- Search for ImagePath referencing TARGET ---
+del /f /q "%TMP%" "%TMPKEYS%" >nul 2>&1
+
+reg query "HKLM\OFFLINE\%CS%\Services" /s /v ImagePath 2>nul | findstr /i "%TARGET%" > "%TMP%"
+
+REM If no matches in active control set, try ControlSet001
+for %%A in ("%TMP%") do if %%~zA==0 (
+  echo [WARN] No matches in %CS%. Trying ControlSet001... >> "%LOG%"
+  reg query "HKLM\OFFLINE\ControlSet001\Services" /s /v ImagePath 2>nul | findstr /i "%TARGET%" > "%TMP%"
+  set "CS=ControlSet001"
+)
+
+for %%A in ("%TMP%") do if %%~zA==0 (
+  echo [WARN] No registry ImagePath reference found for %TARGET%. >> "%LOG%"
+  echo No registry ImagePath reference found for %TARGET%.
+  goto :UNLOAD
+)
+
+REM --- Extract only registry key lines and disable them ---
+for /f "delims=" %%L in ('type "%TMP%" ^| findstr /i /r "^HKEY_LOCAL_MACHINE\\OFFLINE\\.*\\Services\\.*"') do (
+  echo %%L>>"%TMPKEYS%"
+)
+
+set "CHANGED=0"
+for /f "delims=" %%K in ('type "%TMPKEYS%"') do (
+  echo [MATCH] %%K >> "%LOG%"
+  reg add "%%K" /v Start /t REG_DWORD /d 4 /f >> "%LOG%" 2>&1
+  if not errorlevel 1 set /a CHANGED+=1
+)
+
+echo [OK] Disabled %CHANGED% service(s). >> "%LOG%"
+echo Disabled %CHANGED% service(s).
+
+REM --- Optional: rename file if it exists on the real Windows volume ---
+if exist "%WINDRV%\Windows\System32\drivers\%TARGET%" (
+  ren "%WINDRV%\Windows\System32\drivers\%TARGET%" "%TARGET%.bak" >> "%LOG%" 2>&1
+)
+
+:UNLOAD
+reg unload HKLM\OFFLINE >> "%LOG%" 2>&1
+
+echo.
+echo Done. Log:
+echo   %LOG%
+echo Reboot:
 echo   wpeutil reboot
 echo.
 exit /b 0
-
-:CHECKKEY
-set "KEY=%~1"
-
-REM Query ImagePath and search for TARGET (case-insensitive)
-reg query "%KEY%" /v ImagePath 2>nul | find /i "%TARGET%" >nul
-if errorlevel 1 goto :EOF
-
-echo [MATCH] %KEY%>>"%LOG%"
-echo MATCH: %KEY%
-
-REM Disable by setting Start=4
-reg add "%KEY%" /v Start /t REG_DWORD /d 4 /f >>"%LOG%" 2>&1
-if errorlevel 1 (
-  echo [ERROR] Failed to disable %KEY%>>"%LOG%"
-) else (
-  set /a CHANGED=%CHANGED%+1
-  echo [OK] Disabled (Start=4): %KEY%>>"%LOG%"
-)
-
-goto :EOF
